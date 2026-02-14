@@ -1,0 +1,15 @@
+[server]
+enableStaticServing = true
+
+[[theme.fontFaces]]
+family = "estedad"
+url = "app/static/Estedad[wght].woff2"
+style = "normal"
+
+[[theme.fontFaces]]
+family = "estedad"
+url = "app/static/Estedad[wght].ttf"
+style = "normal"
+
+[theme]
+font = "estedad"

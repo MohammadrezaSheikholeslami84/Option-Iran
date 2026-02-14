@@ -1,0 +1,9 @@
+streamlit
+plotly
+pandas
+numpy
+tseopt
+lxml
+jdatetime
+streamlit-autorefresh
+finpy-tse
