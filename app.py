@@ -24,6 +24,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit.components.v1 as components
 from streamlit_autorefresh import st_autorefresh
 from tseopt import get_all_options_data, fetch_historical_lob
@@ -420,7 +421,7 @@ except Exception:
 # -----------------------------
 # Tabs
 # -----------------------------
-tab_filters, tab_bsm, tab_history = st.tabs(["📌 فیلترهای پیشرفته", "🧮 بلک-شولز + IV + Greeks", "📉 تاریخچه قرارداد"])
+tab_filters, tab_bsm, tab_strat, tab_history = st.tabs(["📌 فیلترهای پیشرفته", "🧮 بلک-شولز + IV + Greeks", "🎯 استراتژی‌ها", "📉 تاریخچه قرارداد"])
 
 
 # ============================================================
@@ -570,7 +571,7 @@ with tab_filters:
         st.session_state["bsm_basis_chain"] = 365.0 if basis_choice == "365" else 252.0
 
         st.caption(
-            "قیمت بلک-شولز در جدول با S=آخرین دارایی پایه، K=قیمت اعمال، T=مانده/مبنای سال "
+            "قیمت بلک-شولز در جدول با S=آخرین دارایی پایه، قیمت اعمال=قیمت اعمال، T=مانده/مبنای سال "
             "و پارامترهای r، σ و q محاسبه می‌شود. (نمایش قیمت بلک-شولز بدون اعشار است.)"
         )
 
@@ -1081,11 +1082,15 @@ with tab_bsm:
 
     K = to_float(row.get("strike_price"))
     days = to_float(row.get("days_to_maturity"))
-    S = ua_last if ua_last is not None else to_float(row.get("ua_last_price"))
+    S_market = ua_last if ua_last is not None else to_float(row.get("ua_last_price"))
 
-    if any(v is None for v in [S, K, days]) or S <= 0 or K <= 0 or days <= 0:
+    if any(v is None for v in [S_market, K, days]) or S_market <= 0 or K <= 0 or days <= 0:
         st.error("S یا K یا مانده تا سررسید معتبر نیست.")
         st.stop()
+
+    st.markdown(
+        f"**قرارداد:** {opt_ticker}  |  **نوع:** {opt_type_fa}  |  **قیمت اعمال:** {fmt_num(to_int(K))}  |  **مانده:** {fmt_num(to_int(days))} روز"
+    )
 
     prem_choice = st.selectbox("پرمیوم بازار برای IV", ["آخرین", "پایانی"], index=0, key="bsm_prem_choice")
     market_premium = to_float(row.get("last_price")) if prem_choice == "آخرین" else to_float(row.get("close_price"))
@@ -1101,24 +1106,1260 @@ with tab_bsm:
         basis = st.selectbox("مبنای روز/سال", ["365", "252"], index=0, key="bsm_basis")
 
     T = float(days) / (365.0 if basis == "365" else 252.0)
-    res = bsm_price_greeks(S, K, T, float(r), float(sigma), option_type=opt_type, q=float(q))
-    iv = implied_vol_bisection(market_premium, S, K, T, float(r), option_type=opt_type, q=float(q)) if (market_premium and market_premium > 0) else None
+
+    # --- قیمت نظری با S بازار
+    res_mkt = bsm_price_greeks(S_market, K, T, float(r), float(sigma), option_type=opt_type, q=float(q))
+    iv = (
+        implied_vol_bisection(market_premium, S_market, K, T, float(r), option_type=opt_type, q=float(q))
+        if (market_premium and market_premium > 0)
+        else None
+    )
+
+    st.markdown("---")
+    st.markdown("### 📌 خروجی بر اساس قیمت فعلی دارایی پایه (S بازار)")
 
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("قیمت نظری (BSM)", fmt_num(res["قیمت نظری (بلک-شولز)"], 4) if res else "—")
-    m2.metric("پرمیوم بازار", fmt_num(market_premium, 4) if market_premium is not None else "—")
-    m3.metric("IV", fmt_num(iv, 4) if iv is not None else "—")
-    m4.metric("S/K", fmt_num(S / K, 4))
+    m1.metric("S بازار", fmt_num(to_int(S_market)))
+    m2.metric("قیمت نظری (BSM)", fmt_num(res_mkt["قیمت نظری (بلک-شولز)"], 4) if res_mkt else "—")
+    m3.metric("پرمیوم بازار", fmt_num(market_premium, 4) if market_premium is not None else "—")
+    m4.metric("IV", fmt_num(iv, 4) if iv is not None else "—")
 
-    if res:
+    if res_mkt:
         gdf = pd.DataFrame(
-            [["دلتا", res["دلتا"]], ["گاما", res["گاما"]], ["وگا", res["وگا"]], ["تتا", res["تتا"]], ["رو", res["رو"]]],
+            [
+                ["دلتا", res_mkt["دلتا"]],
+                ["گاما", res_mkt["گاما"]],
+                ["وگا", res_mkt["وگا"]],
+                ["تتا", res_mkt["تتا"]],
+                ["رو", res_mkt["رو"]],
+            ],
             columns=["شاخص", "مقدار"],
         )
         gdf["مقدار"] = gdf["مقدار"].apply(lambda x: fmt_num(x, 6))
-        render_table_html(gdf, height_px=300, title="Greeks")
+        render_table_html(gdf, height_px=300, title="Greeks (بر اساس S بازار)")
+
+    # --- سناریوی قیمت پیش‌بینی‌شده
+    st.markdown("---")
+    st.markdown("### 🔮 سناریوی قیمت پیش‌بینی‌شده دارایی پایه")
+
+    with st.expander("➕ محاسبه بلک-شولز بر اساس S پیش‌بینی‌شده", expanded=True):
+        # حداقل و حداکثر پیشنهادی برای input (نسبت به S فعلی)
+        s_min = max(1.0, float(S_market) * 0.2)
+        s_max = float(S_market) * 5.0
+
+        S_pred = st.number_input(
+            "قیمت پیش‌بینی‌شده دارایی پایه (S پیش‌بینی)",
+            min_value=float(s_min),
+            max_value=float(s_max),
+            value=float(st.session_state.get("bsm_S_pred", float(S_market))),
+            step=max(1.0, float(S_market) * 0.01),
+            key="bsm_S_pred",
+        )
+
+        res_pred = bsm_price_greeks(float(S_pred), K, T, float(r), float(sigma), option_type=opt_type, q=float(q))
+
+        p_mkt = res_mkt["قیمت نظری (بلک-شولز)"] if res_mkt else None
+        p_pred = res_pred["قیمت نظری (بلک-شولز)"] if res_pred else None
+        delta_price = (p_pred - p_mkt) if (p_pred is not None and p_mkt is not None) else None
+
+        s1, s2, s3, s4 = st.columns(4)
+        s1.metric("S پیش‌بینی", fmt_num(to_int(S_pred)))
+        s2.metric("قیمت نظری (BSM) با S پیش‌بینی", fmt_num(p_pred, 4) if p_pred is not None else "—")
+        s3.metric("تغییر قیمت نظری نسبت به S بازار", fmt_num(delta_price, 4) if delta_price is not None else "—")
+        s4.metric("S/K", fmt_num(float(S_pred) / float(K), 4))
+
+        if res_pred:
+            gdf2 = pd.DataFrame(
+                [
+                    ["دلتا", res_pred["دلتا"]],
+                    ["گاما", res_pred["گاما"]],
+                    ["وگا", res_pred["وگا"]],
+                    ["تتا", res_pred["تتا"]],
+                    ["رو", res_pred["رو"]],
+                ],
+                columns=["شاخص", "مقدار"],
+            )
+            gdf2["مقدار"] = gdf2["مقدار"].apply(lambda x: fmt_num(x, 6))
+            render_table_html(gdf2, height_px=300, title="Greeks (بر اساس S پیش‌بینی)")
+
+        # خلاصه‌ی مقایسه‌ای
+        comp = pd.DataFrame(
+            [
+                ["S", S_market, S_pred],
+                ["قیمت نظری", p_mkt, p_pred],
+                ["دلتا", res_mkt["دلتا"] if res_mkt else None, res_pred["دلتا"] if res_pred else None],
+                ["گاما", res_mkt["گاما"] if res_mkt else None, res_pred["گاما"] if res_pred else None],
+                ["وگا", res_mkt["وگا"] if res_mkt else None, res_pred["وگا"] if res_pred else None],
+                ["تتا", res_mkt["تتا"] if res_mkt else None, res_pred["تتا"] if res_pred else None],
+                ["رو", res_mkt["رو"] if res_mkt else None, res_pred["رو"] if res_pred else None],
+            ],
+            columns=["شاخص", "با S بازار", "با S پیش‌بینی"],
+        )
+
+        def _fmt_cell(v, is_price=False):
+            if v is None or _is_na(v):
+                return "—"
+            try:
+                fv = float(v)
+                if not np.isfinite(fv):
+                    return "—"
+                if is_price:
+                    return fmt_num(fv, 4)
+                return fmt_num(fv, 6)
+            except Exception:
+                return safe_str(v)
+
+        comp["با S بازار"] = comp.apply(lambda r: _fmt_cell(r["با S بازار"], is_price=(r["شاخص"] in ["S", "قیمت نظری"])), axis=1)
+        comp["با S پیش‌بینی"] = comp.apply(lambda r: _fmt_cell(r["با S پیش‌بینی"], is_price=(r["شاخص"] in ["S", "قیمت نظری"])), axis=1)
+        render_table_html(comp, height_px=340, title="مقایسه سریع: S بازار vs S پیش‌بینی")
 
 
+
+
+# ============================================================
+# TAB 3: Strategies
+# ============================================================
+
+_bold_re = re.compile(r"\*\*(.+?)\*\*")
+
+def render_rtl_guide(text: str):
+        if not text:
+            return
+
+        # Convert **bold** -> <b>bold</b>
+        html = _bold_re.sub(r"<b>\1</b>", text)
+
+        st.markdown(
+            f"""
+            <div style="
+                direction: rtl;
+                text-align: right;
+                unicode-bidi: embed;
+                white-space: pre-line;  
+                line-height: 1.9;
+                font-size: 0.95rem;
+            ">
+            {html}
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+with tab_strat:
+    st.subheader("🎯 استراتژی‌های معروف آپشن (مقایسه سود/زیان)")
+
+    with st.expander("📘 راهنمای استفاده از این تب", expanded=False):
+        render_rtl_guide(
+            """
+**این تب چه کار می‌کند؟**
+- برای دارایی پایه‌ای که انتخاب کردی، تعدادی استراتژی معروف آپشن را می‌سازد و **سود/زیان در سررسید** را بر اساس **قیمت هدف (S هدف)** محاسبه می‌کند.
+- سپس **بهترین استراتژی** (بیشترین «سود در S هدف») را نمایش می‌دهد و برای هر استراتژی جدول می‌سازد.
+
+**مراحل استفاده**
+1) در تب «فیلترهای پیشرفته»، دارایی پایه را انتخاب کن (لازم نیست قرارداد خاصی را انتخاب کنی).
+2) وارد تب «استراتژی‌ها» شو.
+3) «پرمیوم برای محاسبه» را انتخاب کن:
+   - **Mid (Bid/Ask)**: میانگین Bid و Ask (اگر هر دو موجود باشد) – معمولاً منطقی‌تر برای قیمت‌گذاری.
+   - **آخرین** یا **پایانی**: در صورت نبود Bid/Ask یا برای حالت‌های خاص.
+4) در بخش «قیمت هدف»، مقدار **S هدف** را وارد کن (قیمت مورد انتظار تو در زمان سررسید).
+5) جدول‌ها را ببین:
+   - **Top نتایج کلی**: بهترین‌ها در بین همه استراتژی‌ها
+   - **جدول هر استراتژی**: بهترین ترکیب‌های همان استراتژی
+
+**نکات مهم**
+- این مقایسه «سناریومحور» است (بر اساس S هدف). یعنی احتمال وقوع سناریو در نظر گرفته نمی‌شود.
+- کارمزد، مالیات، محدودیت‌های سفارش‌گذاری و لغزش قیمت لحاظ نشده‌اند.
+- برای استراتژی‌های Covered، فرض شده **یک واحد قرارداد** پوشش داده می‌شود (بر اساس `contract_size` اگر موجود باشد).
+"""
+        )
+
+    # برای اجرای استراتژی‌ها به هر دو نوع Call/Put نیاز داریم
+    try:
+        options_all = chains.options(ua_tse_code=ua_tse_code, option_type="both").copy()
+    except Exception:
+        options_all = options_df.copy()
+
+    if options_all is None or len(options_all) == 0:
+        st.warning("داده‌ای برای استراتژی‌ها موجود نیست.")
+        st.stop()
+
+    # استانداردسازی ستون‌های لازم
+    for c in ["ticker", "tse_code", "ua_ticker", "ua_tse_code"]:
+        if c in options_all.columns:
+            options_all[c] = options_all[c].astype(str)
+
+    if "نوع اختیار" not in options_all.columns:
+        options_all["نوع اختیار"] = options_all["option_type"].apply(map_option_type) if "option_type" in options_all.columns else "—"
+    if "سررسید (میلادی)" not in options_all.columns and "end_date" in options_all.columns:
+        options_all["سررسید (میلادی)"] = options_all["end_date"].apply(fmt_date_yyyymmdd)
+    if "سررسید (شمسی)" not in options_all.columns and "end_date" in options_all.columns:
+        options_all["سررسید (شمسی)"] = options_all["end_date"].apply(gregorian_yyyymmdd_to_jalali_str)
+
+    # قیمت مبنا (S فعلی)
+    S0 = ua_last if ua_last is not None else to_float(options_all.get("ua_last_price", pd.Series([np.nan])).iloc[0])
+    if S0 is None or _is_na(S0) or float(S0) <= 0:
+        st.error("قیمت دارایی پایه (S) معتبر نیست.")
+        st.stop()
+    S0 = float(S0)
+
+    # انتخاب پرمیوم برای محاسبه
+    c1, c2, c3 = st.columns([1.2, 1.0, 1.8])
+    with c1:
+        prem_mode = st.selectbox("پرمیوم برای محاسبه", ["Mid (Bid/Ask)", "آخرین", "پایانی"], index=0, key="str_prem_mode")
+    with c2:
+        top_n = st.number_input("Top N هر جدول", 5, 50, 10, 1, key="str_topn")
+    with c3:
+        st.caption("⚠️ این مقایسه «بر اساس قیمت هدف/سناریو» انجام می‌شود (نه پیش‌بینی احتمالی).")
+
+    def get_premium(row):
+        bid = to_float(row.get("bid_price"))
+        ask = to_float(row.get("ask_price"))
+        lastp = to_float(row.get("last_price"))
+        closep = to_float(row.get("close_price"))
+        if prem_mode.startswith("Mid"):
+            if bid is not None and ask is not None and bid > 0 and ask > 0:
+                return 0.5 * (bid + ask)
+            # fallback
+            return lastp if (lastp is not None and lastp > 0) else closep
+        if prem_mode == "آخرین":
+            return lastp if (lastp is not None and lastp > 0) else closep
+        return closep if (closep is not None and closep > 0) else lastp
+
+    # ورودی سناریو: قیمت هدف
+    with st.expander("🔮 سناریو / قیمت هدف دارایی پایه", expanded=True):
+        s_min = max(1.0, S0 * 0.2)
+        s_max = S0 * 5.0
+        S_target = st.number_input(
+            "قیمت هدف (S هدف)",
+            min_value=float(s_min),
+            max_value=float(s_max),
+            value=float(st.session_state.get("bsm_S_pred", S0)),  # از تب بلک‌شولز هم استفاده می‌کنیم
+            step=max(1.0, S0 * 0.01),
+            key="str_S_target",
+        )
+        S_target = float(S_target)
+
+        st.markdown(
+            f"قیمت فعلی: <span class='num-ltr'><b>{S0:,.0f}</b></span>  |  "
+            f"قیمت هدف: <span class='num-ltr'><b>{S_target:,.0f}</b></span>",
+            unsafe_allow_html=True,
+        )
+
+    # دیتای پایه
+    df = options_all.copy()
+    for col in ["strike_price", "days_to_maturity", "last_price", "close_price", "bid_price", "ask_price", "contract_size"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df["premium"] = df.apply(get_premium, axis=1)
+    df = df[df["premium"].notna() & (df["premium"] > 0)]
+    df = df[df["strike_price"].notna() & (df["strike_price"] > 0)]
+    df = df[df["days_to_maturity"].notna() & (df["days_to_maturity"] > 0)]
+
+    # انتخاب سررسیدها
+    mats = sorted([m for m in df["سررسید (شمسی)"].dropna().unique().tolist() if m != "—"])
+    chosen_mats = st.multiselect("سررسید (شمسی) برای محاسبه", mats, default=mats[: min(3, len(mats))], key="str_mats")
+    if chosen_mats:
+        df = df[df["سررسید (شمسی)"].isin(chosen_mats)]
+
+    if len(df) == 0:
+        st.warning("بعد از فیلترها داده‌ای باقی نماند.")
+        st.stop()
+
+    # محدودسازی برای جلوگیری از انفجار ترکیبی
+    def select_near_atm(sub: pd.DataFrame, kcol="strike_price", n=20):
+        sub = sub.copy()
+        sub["dist_atm"] = (sub[kcol] - S0).abs()
+        return sub.sort_values("dist_atm").head(n).drop(columns=["dist_atm"])
+
+
+    def legs_html(lines):
+        """Readable legs (RTL) with clear Buy/Sell; returns HTML with <br>."""
+        if not lines:
+            return "—"
+        return "<br>".join([f"• {ln}" for ln in lines])
+
+    def style_profit_dataframe(df_in: pd.DataFrame, profit_col: str):
+        """Return a pandas Styler coloring profit column; Streamlit dataframe remains sortable."""
+        df2 = df_in.copy()
+        if profit_col in df2.columns:
+            df2[profit_col] = pd.to_numeric(df2[profit_col], errors="coerce")
+
+            def _sty(v):
+                try:
+                    if v > 0:
+                        return "color:#1b5e20;font-weight:900"
+                    if v < 0:
+                        return "color:#b71c1c;font-weight:900"
+                    return "color:#424242"
+                except Exception:
+                    return ""
+
+            return df2.style.applymap(_sty, subset=[profit_col]).format(precision=2, na_rep="—")
+        return df2
+
+
+    def _fmt_num_html(v, decimals=2, is_pct=False):
+        try:
+            if v is None or _is_na(v):
+                return "—"
+            fv = float(v)
+            if not np.isfinite(fv):
+                return "—"
+            s = f"{fv:,.{decimals}f}"
+            if is_pct:
+                s += "%"
+            return wrap_num_ltr(s)
+        except Exception:
+            return safe_str(v)
+
+    def _profit_html(v):
+        try:
+            if v is None or _is_na(v):
+                return "—"
+            fv = float(v)
+            if not np.isfinite(fv):
+                return "—"
+            if fv > 0:
+                col = "#1b5e20"
+            elif fv < 0:
+                col = "#b71c1c"
+            else:
+                col = "#424242"
+            return f"<span class='num-ltr' style='color:{col};font-weight:900'>{fv:,.2f}</span>"
+        except Exception:
+            return safe_str(v)
+
+    def show_table(df_in: pd.DataFrame, title: str, key_prefix: str, top_n: int):
+        """Sortable (server-side) + full visibility via HTML table (no truncation)."""
+        if df_in is None or len(df_in) == 0:
+            st.info("داده‌ای برای نمایش وجود ندارد.")
+            return
+
+        st.markdown(f"#### {title}")
+        c1, c2, c3 = st.columns([2, 1, 1])
+        with c1:
+            sort_col = st.selectbox("مرتب‌سازی بر اساس", df_in.columns.tolist(), index=0, key=f"{key_prefix}_sort")
+        with c2:
+            sort_asc = st.checkbox("صعودی", value=False, key=f"{key_prefix}_asc")
+        with c3:
+            n = st.number_input("تعداد ردیف", 5, 200, int(top_n), 5, key=f"{key_prefix}_n")
+
+        dfx = df_in.copy()
+
+        try:
+            dfx["_sort_tmp"] = pd.to_numeric(dfx[sort_col], errors="coerce")
+            if dfx["_sort_tmp"].notna().any():
+                dfx = dfx.sort_values("_sort_tmp", ascending=sort_asc)
+            else:
+                dfx = dfx.sort_values(sort_col, ascending=sort_asc)
+            dfx = dfx.drop(columns=["_sort_tmp"], errors="ignore")
+        except Exception:
+            pass
+
+        dfx = dfx.head(int(n)).copy()
+
+        # HTML-friendly formatting
+        if "سود در S هدف" in dfx.columns:
+            dfx["سود در S هدف"] = pd.to_numeric(dfx["سود در S هدف"], errors="coerce").apply(_profit_html)
+        if "ROI% تقریبی" in dfx.columns:
+            dfx["ROI% تقریبی"] = pd.to_numeric(dfx["ROI% تقریبی"], errors="coerce").apply(lambda x: _fmt_num_html(x, 2, True))
+        for col in ["هزینه/دریافتی (پرمیوم خالص)", "حداکثر زیان"]:
+            if col in dfx.columns:
+                dfx[col] = pd.to_numeric(dfx[col], errors="coerce").apply(lambda x: _fmt_num_html(x, 0, False))
+        if "حداکثر سود" in dfx.columns:
+            def _mx(v):
+                if isinstance(v, str):
+                    return v
+                return _fmt_num_html(v, 0, False)
+            dfx["حداکثر سود"] = dfx["حداکثر سود"].apply(_mx)
+
+        render_table_html(dfx, height_px=460, title=None)
+
+    # محاسبات استراتژی‌ها (سود در سررسید)
+    def payoff_long_call(S, K, prem): return max(S - K, 0.0) - prem
+    def payoff_long_put(S, K, prem): return max(K - S, 0.0) - prem
+
+    def make_row(strategy, mat, legs, net_premium, max_profit, max_loss, breakeven, profit_at_target, roi, days):
+        return {
+            "استراتژی": strategy,
+            "سررسید": mat,
+            "مانده (روز)": days,
+            "لِگ‌ها": legs,
+            "هزینه/دریافتی (پرمیوم خالص)": net_premium,
+            "حداکثر سود": max_profit,
+            "حداکثر زیان": max_loss,
+            "نقطه/نقاط سربه‌سر": breakeven,
+            "سود در S هدف": profit_at_target,
+            "ROI% تقریبی": roi,
+        }
+
+    rows = []
+
+    # گروه‌بندی بر اساس سررسید
+    for mat, g in df.groupby("سررسید (شمسی)"):
+        days_left = int(pd.to_numeric(g["days_to_maturity"], errors="coerce").min())
+        calls = g[g["نوع اختیار"].astype(str).str.contains("خرید", na=False)].copy()
+        puts = g[g["نوع اختیار"].astype(str).str.contains("فروش", na=False)].copy()
+
+        # نزدیک به ATM برای ترکیبی‌ها
+        calls_n = select_near_atm(calls, n=20) if len(calls) else calls
+        puts_n = select_near_atm(puts, n=20) if len(puts) else puts
+
+        # --- Long Call / Long Put (تک‌قرارداد)
+        for _, r0 in calls.iterrows():
+            K = float(r0["strike_price"])
+            prem = float(r0["premium"])
+            pr = payoff_long_call(S_target, K, prem)
+            legs = legs_html([
+                f"خرید Call: <b>{r0.get('ticker')}</b> | قیمت اعمال={wrap_num_ltr(f'{K:,.0f}')} | پرمیوم={wrap_num_ltr(f'{prem:,.0f}')}",
+            ])
+            max_loss = -prem
+            max_profit = "نامحدود"
+            breakeven = f"{(K + prem):,.0f}"
+            roi = (pr / prem * 100.0) if prem > 0 else np.nan
+            rows.append(make_row("Long Call", mat, legs, prem, max_profit, max_loss, breakeven, pr, roi, days_left))
+
+        for _, r0 in puts.iterrows():
+            K = float(r0["strike_price"])
+            prem = float(r0["premium"])
+            pr = payoff_long_put(S_target, K, prem)
+            legs = legs_html([
+                f"خرید Put: <b>{r0.get('ticker')}</b> | قیمت اعمال={wrap_num_ltr(f'{K:,.0f}')} | پرمیوم={wrap_num_ltr(f'{prem:,.0f}')}",
+            ])
+            max_loss = -prem
+            max_profit = f"{(K - prem):,.0f}"  # تقریبی (تا S=0)
+            breakeven = f"{(K - prem):,.0f}"
+            roi = (pr / prem * 100.0) if prem > 0 else np.nan
+            rows.append(make_row("Long Put", mat, legs, prem, max_profit, max_loss, breakeven, pr, roi, days_left))
+
+
+        
+        # --- Short Call / Short Put (تک‌قرارداد)
+        for _, r0 in calls.iterrows():
+            K = float(r0["strike_price"])
+            prem = float(r0["premium"])  # premium received
+            pr = prem - max(S_target - K, 0.0)
+            legs = legs_html([
+                f"فروش Call: <b>{r0.get('ticker')}</b> | قیمت اعمال={wrap_num_ltr(f'{K:,.0f}')} | پرمیوم={wrap_num_ltr(f'{prem:,.0f}')}",
+            ])
+            max_profit = prem
+            max_loss = "نامحدود"
+            breakeven = f"{(K + prem):,.0f}"
+            roi = np.nan  # مارجین/وجه تضمین در این محاسبه لحاظ نشده
+            rows.append(make_row("Short Call", mat, legs, -prem, max_profit, max_loss, breakeven, pr, roi, days_left))
+
+        for _, r0 in puts.iterrows():
+            K = float(r0["strike_price"])
+            prem = float(r0["premium"])  # premium received
+            pr = prem - max(K - S_target, 0.0)
+            legs = legs_html([
+                f"فروش Put: <b>{r0.get('ticker')}</b> | قیمت اعمال={wrap_num_ltr(f'{K:,.0f}')} | پرمیوم={wrap_num_ltr(f'{prem:,.0f}')}",
+            ])
+            max_profit = prem
+            max_loss = f"{(prem - K):,.0f}"  # تا S=0
+            breakeven = f"{(K - prem):,.0f}"
+            roi = np.nan  # وجه تضمین لحاظ نشده
+            rows.append(make_row("Short Put", mat, legs, -prem, max_profit, max_loss, breakeven, pr, roi, days_left))
+
+# --- Covered Call: Long Underlying + Short Call (فرض: پوشش یک قرارداد)
+        if len(calls) > 0:
+            # تعداد سهم برای پوشش: از contract_size استفاده می‌کنیم، اگر نبود 1
+            for _, r0 in calls.iterrows():
+                K = float(r0["strike_price"])
+                prem = float(r0["premium"])  # premium received from selling call
+                csize = to_float(r0.get("contract_size"))
+                csize = float(csize) if (csize is not None and not _is_na(csize) and csize > 0) else 1.0
+
+                # Payoff per ONE underlying unit:
+                # (S_T - S0) + prem - max(S_T-K,0)
+                pr_unit = (S_target - S0) + prem - max(S_target - K, 0.0)
+                pr = pr_unit * csize
+
+                # Risk/return:
+                # max profit when S_T >= K: (K - S0) + prem
+                max_profit = ((K - S0) + prem) * csize
+                # max loss roughly when S_T -> 0: (-S0 + prem) * csize
+                max_loss = ((0.0 - S0) + prem) * csize
+
+                breakeven = (S0 - prem)
+                roi = (pr / (S0 * csize) * 100.0) if (S0 * csize) > 0 else np.nan
+
+                legs = legs_html([
+                    f"خرید سهم پایه: {wrap_num_ltr(f'{csize:,.0f}')} واحد",
+                    f"فروش Call: <b>{r0.get('ticker')}</b> | قیمت اعمال={wrap_num_ltr(f'{K:,.0f}')} | پرمیوم={wrap_num_ltr(f'{prem:,.0f}')}",
+                ])
+                rows.append(make_row("Covered Call", mat, legs, -prem * csize, max_profit, max_loss, f"{breakeven:,.0f}", pr, roi, days_left))
+
+        # --- Cash-Secured Put: Short Put (پول نقد برای خرید سهم در K)
+        if len(puts) > 0:
+            for _, r0 in puts.iterrows():
+                K = float(r0["strike_price"])
+                prem = float(r0["premium"])  # premium received
+                csize = to_float(r0.get("contract_size"))
+                csize = float(csize) if (csize is not None and not _is_na(csize) and csize > 0) else 1.0
+
+                # payoff per unit: prem - max(K - S_T, 0)
+                pr_unit = prem - max(K - S_target, 0.0)
+                pr = pr_unit * csize
+
+                # max profit: prem
+                max_profit = prem * csize
+                # max loss at S_T -> 0: prem - K
+                max_loss = (prem - K) * csize
+                breakeven = (K - prem)
+                cash_req = K * csize
+                roi = (pr / cash_req * 100.0) if cash_req > 0 else np.nan
+
+                legs = legs_html([
+                    f"فروش Put (Cash-Secured): <b>{r0.get('ticker')}</b> | قیمت اعمال={wrap_num_ltr(f'{K:,.0f}')} | پرمیوم={wrap_num_ltr(f'{prem:,.0f}')}",
+                ])
+                rows.append(make_row("Short Put", mat, legs, -prem * csize, max_profit, max_loss, f"{breakeven:,.0f}", pr, roi, days_left))
+
+        
+        # --- Protective Put: Long Underlying + Long Put
+        if len(puts) > 0:
+            for _, r0 in puts.iterrows():
+                K = float(r0["strike_price"])
+                prem = float(r0["premium"])  # premium paid
+                csize = to_float(r0.get("contract_size"))
+                csize = float(csize) if (csize is not None and not _is_na(csize) and csize > 0) else 1.0
+
+                # (S_T - S0) + max(K - S_T,0) - prem
+                pr_unit = (S_target - S0) + max(K - S_target, 0.0) - prem
+                pr = pr_unit * csize
+
+                max_profit = "نامحدود"
+                max_loss = ((K - S0) - prem) * csize  # در بدترین حالت
+                breakeven = (S0 + prem)
+                roi = (pr / (S0 * csize) * 100.0) if (S0 * csize) > 0 else np.nan
+
+                legs = legs_html([
+                    f"خرید سهم پایه: {wrap_num_ltr(f'{csize:,.0f}')} واحد",
+                    f"خرید Put: <b>{r0.get('ticker')}</b> | قیمت اعمال={wrap_num_ltr(f'{K:,.0f}')} | پرمیوم={wrap_num_ltr(f'{prem:,.0f}')}",
+                ])
+                rows.append(make_row("Protective Put", mat, legs, prem * csize, max_profit, max_loss, f"{breakeven:,.0f}", pr, roi, days_left))
+
+        # --- Collar: Long Underlying + Long Put (OTM) + Short Call (OTM)
+        if len(calls_n) and len(puts_n):
+            c_otm = calls_n[calls_n["strike_price"].astype(float) >= S0].sort_values("strike_price").head(8)
+            p_otm = puts_n[puts_n["strike_price"].astype(float) <= S0].sort_values("strike_price", ascending=False).head(8)
+            for _, pr0 in p_otm.iterrows():
+                Kp = float(pr0["strike_price"])
+                prem_p = float(pr0["premium"])
+                for _, cr in c_otm.iterrows():
+                    Kc = float(cr["strike_price"])
+                    prem_c = float(cr["premium"])  # received
+                    if Kp >= Kc:
+                        continue
+                    net = prem_p - prem_c  # debit(+)/credit(-)
+                    # payoff: (S-S0) + max(Kp-S,0) - prem_p + prem_c - max(S-Kc,0)
+                    pr_val = (S_target - S0) + max(Kp - S_target, 0.0) - prem_p + prem_c - max(S_target - Kc, 0.0)
+
+                    max_profit = ((Kc - S0) - net)
+                    max_loss = ((Kp - S0) - net)
+                    breakeven = (S0 + net)
+                    roi = np.nan
+
+                    legs = legs_html([
+                        f"خرید سهم پایه: 1 واحد",
+                        f"خرید Put: <b>{pr0.get('ticker')}</b> | قیمت اعمال={wrap_num_ltr(f'{Kp:,.0f}')} | پرمیوم={wrap_num_ltr(f'{prem_p:,.0f}')}",
+                        f"فروش Call: <b>{cr.get('ticker')}</b> | قیمت اعمال={wrap_num_ltr(f'{Kc:,.0f}')} | پرمیوم={wrap_num_ltr(f'{prem_c:,.0f}')}",
+                        f"پرمیوم خالص = {wrap_num_ltr(f'{net:,.0f}')}",
+                    ])
+                    rows.append(make_row("Collar", mat, legs, net, max_profit, max_loss, f"{breakeven:,.0f}", pr_val, roi, days_left))
+
+        # --- Conversion: Long Underlying + Long Put + Short Call (هم‌استرایک)
+        if len(calls_n) and len(puts_n):
+            calls_n2 = calls_n.copy()
+            puts_n2 = puts_n.copy()
+            calls_n2["K"] = calls_n2["strike_price"].astype(float)
+            puts_n2["K"] = puts_n2["strike_price"].astype(float)
+            common = sorted(set(calls_n2["K"]).intersection(set(puts_n2["K"])))
+            common = sorted(common, key=lambda k: abs(k - S0))[:10]
+            for K in common:
+                c0 = calls_n2[calls_n2["K"] == K].iloc[0].to_dict()
+                p0 = puts_n2[puts_n2["K"] == K].iloc[0].to_dict()
+                prem_c = float(c0.get("premium") or 0.0)  # received
+                prem_p = float(p0.get("premium") or 0.0)  # paid
+                net = prem_p - prem_c  # debit(+)/credit(-)
+                # payoff ثابت: K - S0 - net
+                pr_val = (K - S0) - net
+                max_profit = pr_val
+                max_loss = pr_val
+                breakeven = "—"
+                roi = np.nan
+
+                legs = legs_html([
+                    "خرید سهم پایه: 1 واحد",
+                    f"خرید Put: <b>{p0.get('ticker')}</b> | قیمت اعمال={wrap_num_ltr(f'{K:,.0f}')} | پرمیوم={wrap_num_ltr(f'{prem_p:,.0f}')}",
+                    f"فروش Call: <b>{c0.get('ticker')}</b> | قیمت اعمال={wrap_num_ltr(f'{K:,.0f}')} | پرمیوم={wrap_num_ltr(f'{prem_c:,.0f}')}",
+                    f"پرمیوم خالص = {wrap_num_ltr(f'{net:,.0f}')}",
+                ])
+                rows.append(make_row("Conversion", mat, legs, net, max_profit, max_loss, breakeven, pr_val, roi, days_left))
+
+# --- Bull Call Spread (Debit): Buy lower K, Sell higher K
+        if len(calls_n) >= 2:
+            c_sorted = calls_n.sort_values("strike_price")
+            c_list = c_sorted.to_dict("records")
+            for i in range(len(c_list) - 1):
+                for j in range(i + 1, len(c_list)):
+                    c_buy, c_sell = c_list[i], c_list[j]
+                    K1, K2 = float(c_buy["strike_price"]), float(c_sell["strike_price"])
+                    prem1, prem2 = float(c_buy["premium"]), float(c_sell["premium"])
+                    net = prem1 - prem2  # debit
+                    width = K2 - K1
+                    if width <= 0:
+                        continue
+                    payoff = min(max(S_target - K1, 0.0), width) - net
+                    max_profit = width - net
+                    max_loss = -net
+                    breakeven = K1 + net
+                    roi = (payoff / abs(net) * 100.0) if net != 0 else np.nan
+                    legs = legs_html([
+                        f"خرید Call: <b>{c_buy.get('ticker')}</b> | قیمت اعمال={wrap_num_ltr(f'{K1:,.0f}')} | پرمیوم={wrap_num_ltr(f'{prem1:,.0f}')}",
+                        f"فروش Call: <b>{c_sell.get('ticker')}</b> | قیمت اعمال={wrap_num_ltr(f'{K2:,.0f}')} | پرمیوم={wrap_num_ltr(f'{prem2:,.0f}')}",
+                    ])
+                    rows.append(make_row("Bull Call Spread", mat, legs, net, max_profit, max_loss, f"{breakeven:,.0f}", payoff, roi, days_left))
+
+        
+        # --- Bear Call Spread (Credit): Sell lower K, Buy higher K
+        if len(calls_n) >= 2:
+            c_sorted = calls_n.sort_values("strike_price")
+            c_list = c_sorted.to_dict("records")
+            for i in range(len(c_list) - 1):
+                for j in range(i + 1, len(c_list)):
+                    c_sell, c_buy = c_list[i], c_list[j]  # sell lower, buy higher
+                    K1, K2 = float(c_sell["strike_price"]), float(c_buy["strike_price"])
+                    prem_sell, prem_buy = float(c_sell["premium"]), float(c_buy["premium"])
+                    width = K2 - K1
+                    if width <= 0:
+                        continue
+                    credit = prem_sell - prem_buy
+                    payoff = credit - min(max(S_target - K1, 0.0), width)
+                    max_profit = credit
+                    max_loss = (credit - width)
+                    breakeven = K1 + credit
+                    roi = np.nan
+                    legs = legs_html([
+                        f"فروش Call: <b>{c_sell.get('ticker')}</b> | قیمت اعمال={wrap_num_ltr(f'{K1:,.0f}')} | پرمیوم={wrap_num_ltr(f'{prem_sell:,.0f}')}",
+                        f"خرید Call: <b>{c_buy.get('ticker')}</b> | قیمت اعمال={wrap_num_ltr(f'{K2:,.0f}')} | پرمیوم={wrap_num_ltr(f'{prem_buy:,.0f}')}",
+                        f"اعتبار (Credit) = {wrap_num_ltr(f'{credit:,.0f}')}",
+                    ])
+                    rows.append(make_row("Bear Call Spread", mat, legs, -credit, max_profit, max_loss, f"{breakeven:,.0f}", payoff, roi, days_left))
+
+# --- Bear Put Spread (Debit): Buy higher K, Sell lower K
+        if len(puts_n) >= 2:
+            p_sorted = puts_n.sort_values("strike_price")
+            p_list = p_sorted.to_dict("records")
+            for i in range(len(p_list) - 1):
+                for j in range(i + 1, len(p_list)):
+                    p_low, p_high = p_list[i], p_list[j]
+                    # buy higher K, sell lower K
+                    buy, sell = p_high, p_low
+                    K2, K1 = float(buy["strike_price"]), float(sell["strike_price"])
+                    prem_buy, prem_sell = float(buy["premium"]), float(sell["premium"])
+                    net = prem_buy - prem_sell  # debit
+                    width = K2 - K1
+                    if width <= 0:
+                        continue
+                    payoff = min(max(K2 - S_target, 0.0), width) - net
+                    max_profit = width - net
+                    max_loss = -net
+                    breakeven = K2 - net
+                    roi = (payoff / abs(net) * 100.0) if net != 0 else np.nan
+                    legs = legs_html([
+                        f"خرید Put: <b>{buy.get('ticker')}</b> | قیمت اعمال={wrap_num_ltr(f'{K2:,.0f}')} | پرمیوم={wrap_num_ltr(f'{prem_buy:,.0f}')}",
+                        f"فروش Put: <b>{sell.get('ticker')}</b> | قیمت اعمال={wrap_num_ltr(f'{K1:,.0f}')} | پرمیوم={wrap_num_ltr(f'{prem_sell:,.0f}')}",
+                    ])
+                    rows.append(make_row("Bear Put Spread", mat, legs, net, max_profit, max_loss, f"{breakeven:,.0f}", payoff, roi, days_left))
+
+        # --- Straddle (ATM-ish): Buy Call+Put same K (تقریباً)
+        if len(calls_n) and len(puts_n):
+            # Map by strike (rounded) for matching
+            calls_n2 = calls_n.copy()
+            puts_n2 = puts_n.copy()
+            calls_n2["K"] = calls_n2["strike_price"].astype(float)
+            puts_n2["K"] = puts_n2["strike_price"].astype(float)
+            # find common strikes
+            common = sorted(set(calls_n2["K"]).intersection(set(puts_n2["K"])))
+            # prefer near ATM
+            common = sorted(common, key=lambda k: abs(k - S0))[:10]
+            for K in common:
+                c0 = calls_n2[calls_n2["K"] == K].iloc[0].to_dict()
+                p0 = puts_n2[puts_n2["K"] == K].iloc[0].to_dict()
+                net = float(c0["premium"]) + float(p0["premium"])
+                payoff = abs(S_target - K) - net
+                max_loss = -net
+                max_profit = "نامحدود"
+                be1, be2 = K - net, K + net
+                roi = (payoff / net * 100.0) if net > 0 else np.nan
+                prem_c = float(c0.get("premium") or 0)
+                prem_p = float(p0.get("premium") or 0)
+                legs = legs_html([
+                    f"خرید Call: <b>{c0.get('ticker')}</b> | قیمت اعمال={wrap_num_ltr(f'{K:,.0f}')} | پرمیوم={wrap_num_ltr(f'{prem_c:,.0f}')}",
+                    f"خرید Put: <b>{p0.get('ticker')}</b> | قیمت اعمال={wrap_num_ltr(f'{K:,.0f}')} | پرمیوم={wrap_num_ltr(f'{prem_p:,.0f}')}",
+                    f"مجموع پرمیوم = {wrap_num_ltr(f'{net:,.0f}')}",
+                ])
+                rows.append(make_row("Long Straddle", mat, legs, net, max_profit, max_loss, f"{be1:,.0f} , {be2:,.0f}", payoff, roi, days_left))
+
+        # --- Strangle: Buy OTM Put (Kp<S0) + Buy OTM Call (Kc>S0)
+        if len(calls_n) and len(puts_n):
+            c_otm = calls_n[calls_n["strike_price"].astype(float) >= S0].sort_values("strike_price").head(10)
+            p_otm = puts_n[puts_n["strike_price"].astype(float) <= S0].sort_values("strike_price", ascending=False).head(10)
+            if len(c_otm) and len(p_otm):
+                for _, cr in c_otm.iterrows():
+                    for _, pr0 in p_otm.iterrows():
+                        Kc = float(cr["strike_price"])
+                        Kp = float(pr0["strike_price"])
+                        net = float(cr["premium"]) + float(pr0["premium"])
+                        payoff = max(S_target - Kc, 0.0) + max(Kp - S_target, 0.0) - net
+                        max_loss = -net
+                        max_profit = "نامحدود"
+                        be_low = Kp - net
+                        be_high = Kc + net
+                        roi = (payoff / net * 100.0) if net > 0 else np.nan
+                        prem_p = float(pr0.get("premium") or 0)
+                        prem_c = float(cr.get("premium") or 0)
+                        legs = legs_html([
+                            f"خرید Put: <b>{pr0.get('ticker')}</b> | قیمت اعمال={wrap_num_ltr(f'{Kp:,.0f}')} | پرمیوم={wrap_num_ltr(f'{prem_p:,.0f}')}",
+                            f"خرید Call: <b>{cr.get('ticker')}</b> | قیمت اعمال={wrap_num_ltr(f'{Kc:,.0f}')} | پرمیوم={wrap_num_ltr(f'{prem_c:,.0f}')}",
+                            f"مجموع پرمیوم = {wrap_num_ltr(f'{net:,.0f}')}",
+                        ])
+                        rows.append(make_row("Long Strangle", mat, legs, net, max_profit, max_loss, f"{be_low:,.0f} , {be_high:,.0f}", payoff, roi, days_left))
+        
+        # --- Short Straddle: Sell Call + Sell Put (same K)
+        if len(calls_n) and len(puts_n):
+            calls_n2 = calls_n.copy()
+            puts_n2 = puts_n.copy()
+            calls_n2["K"] = calls_n2["strike_price"].astype(float)
+            puts_n2["K"] = puts_n2["strike_price"].astype(float)
+            common = sorted(set(calls_n2["K"]).intersection(set(puts_n2["K"])))
+            common = sorted(common, key=lambda k: abs(k - S0))[:10]
+            for K in common:
+                c0 = calls_n2[calls_n2["K"] == K].iloc[0].to_dict()
+                p0 = puts_n2[puts_n2["K"] == K].iloc[0].to_dict()
+                prem_c = float(c0.get("premium") or 0.0)
+                prem_p = float(p0.get("premium") or 0.0)
+                credit = prem_c + prem_p
+                payoff = credit - abs(S_target - K)
+                max_profit = credit
+                max_loss = "نامحدود"
+                be1, be2 = K - credit, K + credit
+                roi = np.nan
+                legs = legs_html([
+                    f"فروش Call: <b>{c0.get('ticker')}</b> | قیمت اعمال={wrap_num_ltr(f'{K:,.0f}')} | پرمیوم={wrap_num_ltr(f'{prem_c:,.0f}')}",
+                    f"فروش Put: <b>{p0.get('ticker')}</b> | قیمت اعمال={wrap_num_ltr(f'{K:,.0f}')} | پرمیوم={wrap_num_ltr(f'{prem_p:,.0f}')}",
+                    f"مجموع اعتبار = {wrap_num_ltr(f'{credit:,.0f}')}",
+                ])
+                rows.append(make_row("Short Straddle", mat, legs, -credit, max_profit, max_loss, f"{be1:,.0f} , {be2:,.0f}", payoff, roi, days_left))
+
+        # --- Short Strangle: Sell OTM Put + Sell OTM Call
+        if len(calls_n) and len(puts_n):
+            c_otm = calls_n[calls_n["strike_price"].astype(float) >= S0].sort_values("strike_price").head(10)
+            p_otm = puts_n[puts_n["strike_price"].astype(float) <= S0].sort_values("strike_price", ascending=False).head(10)
+            for _, cr in c_otm.iterrows():
+                for _, pr0 in p_otm.iterrows():
+                    Kc = float(cr["strike_price"])
+                    Kp = float(pr0["strike_price"])
+                    if Kp >= Kc:
+                        continue
+                    prem_c = float(cr["premium"])
+                    prem_p = float(pr0["premium"])
+                    credit = prem_c + prem_p
+                    payoff = credit - max(Kp - S_target, 0.0) - max(S_target - Kc, 0.0)
+                    max_profit = credit
+                    max_loss = "نامحدود"
+                    be_low = Kp - credit
+                    be_high = Kc + credit
+                    roi = np.nan
+                    legs = legs_html([
+                        f"فروش Put: <b>{pr0.get('ticker')}</b> | قیمت اعمال={wrap_num_ltr(f'{Kp:,.0f}')} | پرمیوم={wrap_num_ltr(f'{prem_p:,.0f}')}",
+                        f"فروش Call: <b>{cr.get('ticker')}</b> | قیمت اعمال={wrap_num_ltr(f'{Kc:,.0f}')} | پرمیوم={wrap_num_ltr(f'{prem_c:,.0f}')}",
+                        f"مجموع اعتبار = {wrap_num_ltr(f'{credit:,.0f}')}",
+                    ])
+                    rows.append(make_row("Short Strangle", mat, legs, -credit, max_profit, max_loss, f"{be_low:,.0f} , {be_high:,.0f}", payoff, roi, days_left))
+
+        # --- Long Gut / Short Gut (ITM Strangle با دو استرایک متفاوت)
+        if len(calls_n) and len(puts_n):
+            c_itm = calls_n[calls_n["strike_price"].astype(float) <= S0].sort_values("strike_price", ascending=False).head(8)
+            p_itm = puts_n[puts_n["strike_price"].astype(float) >= S0].sort_values("strike_price").head(8)
+            for _, cr in c_itm.iterrows():
+                for _, pr0 in p_itm.iterrows():
+                    Kc = float(cr["strike_price"])
+                    Kp = float(pr0["strike_price"])
+                    if Kc >= Kp:
+                        continue
+                    prem_c = float(cr["premium"])
+                    prem_p = float(pr0["premium"])
+                    net = prem_c + prem_p  # debit
+                    payoff = max(S_target - Kc, 0.0) + max(Kp - S_target, 0.0) - net
+                    be_low = Kp - net
+                    be_high = Kc + net
+                    legs = legs_html([
+                        f"خرید Call (ITM): <b>{cr.get('ticker')}</b> | قیمت اعمال={wrap_num_ltr(f'{Kc:,.0f}')} | پرمیوم={wrap_num_ltr(f'{prem_c:,.0f}')}",
+                        f"خرید Put (ITM): <b>{pr0.get('ticker')}</b> | قیمت اعمال={wrap_num_ltr(f'{Kp:,.0f}')} | پرمیوم={wrap_num_ltr(f'{prem_p:,.0f}')}",
+                        f"مجموع پرمیوم = {wrap_num_ltr(f'{net:,.0f}')}",
+                    ])
+                    rows.append(make_row("Long Gut", mat, legs, net, "نامحدود", -net, f"{be_low:,.0f} , {be_high:,.0f}", payoff, (payoff/net*100.0) if net>0 else np.nan, days_left))
+
+                    credit = net
+                    payoff_s = credit - (max(S_target - Kc, 0.0) + max(Kp - S_target, 0.0))
+                    legs_s = legs_html([
+                        f"فروش Call (ITM): <b>{cr.get('ticker')}</b> | قیمت اعمال={wrap_num_ltr(f'{Kc:,.0f}')} | پرمیوم={wrap_num_ltr(f'{prem_c:,.0f}')}",
+                        f"فروش Put (ITM): <b>{pr0.get('ticker')}</b> | قیمت اعمال={wrap_num_ltr(f'{Kp:,.0f}')} | پرمیوم={wrap_num_ltr(f'{prem_p:,.0f}')}",
+                        f"مجموع اعتبار = {wrap_num_ltr(f'{credit:,.0f}')}",
+                    ])
+                    rows.append(make_row("Short Gut", mat, legs_s, -credit, credit, "نامحدود", f"{be_low:,.0f} , {be_high:,.0f}", payoff_s, np.nan, days_left))
+
+        # --- Call Ratio Spread (1x2): Buy 1 Call K1, Sell 2 Calls K2 (K2>K1)
+        if len(calls_n) >= 2:
+            c_sorted = calls_n.sort_values("strike_price")
+            c_list = c_sorted.to_dict("records")
+            for i in range(len(c_list) - 1):
+                for j in range(i + 1, len(c_list)):
+                    c_buy, c_sell = c_list[i], c_list[j]
+                    K1, K2 = float(c_buy["strike_price"]), float(c_sell["strike_price"])
+                    prem_buy, prem_sell = float(c_buy["premium"]), float(c_sell["premium"])
+                    if K2 <= K1:
+                        continue
+                    net = prem_buy - 2.0 * prem_sell  # debit(+)/credit(-)
+                    payoff = max(S_target - K1, 0.0) - 2.0 * max(S_target - K2, 0.0) - net
+
+                    # breakevens (تقریبی)
+                    be_low = K1 + net
+                    be_high = (2.0 * K2 - K1) - net
+                    legs = legs_html([
+                        f"خرید Call: <b>{c_buy.get('ticker')}</b> | قیمت اعمال={wrap_num_ltr(f'{K1:,.0f}')} | پرمیوم={wrap_num_ltr(f'{prem_buy:,.0f}')}",
+                        f"فروش 2× Call: <b>{c_sell.get('ticker')}</b> | قیمت اعمال={wrap_num_ltr(f'{K2:,.0f}')} | پرمیوم={wrap_num_ltr(f'{prem_sell:,.0f}')}",
+                        f"پرمیوم خالص = {wrap_num_ltr(f'{net:,.0f}')}",
+                    ])
+                    rows.append(make_row("Call Ratio Spread", mat, legs, net, f"{(K2-K1 - net):,.0f}", "نامحدود", f"{be_low:,.0f} , {be_high:,.0f}", payoff, np.nan, days_left))
+
+        # --- Short Call Butterfly: Sell K1, Buy 2x K2, Sell K3 (Reverse of Long)
+        if len(calls_n) >= 3:
+            c_sorted = calls_n.sort_values("strike_price")
+            c_list = c_sorted.to_dict("records")
+            for i in range(len(c_list) - 2):
+                for j in range(i + 1, len(c_list) - 1):
+                    for k in range(j + 1, len(c_list)):
+                        c1, c2, c3 = c_list[i], c_list[j], c_list[k]
+                        K1, K2, K3 = float(c1["strike_price"]), float(c2["strike_price"]), float(c3["strike_price"])
+                        if not (K1 < K2 < K3):
+                            continue
+                        prem1, prem2, prem3 = float(c1["premium"]), float(c2["premium"]), float(c3["premium"])
+                        credit = prem1 - 2.0 * prem2 + prem3  # sell1 - buy2 + sell1
+                        width = min(K2 - K1, K3 - K2)
+                        payoff = credit - (min(max(S_target - K1, 0.0), K2 - K1) - min(max(S_target - K2, 0.0), K3 - K2))
+
+                        max_profit = credit
+                        max_loss = credit - width
+                        be_low = K1 + credit
+                        be_high = K3 - credit
+
+                        legs = legs_html([
+                            f"فروش Call: <b>{c1.get('ticker')}</b> | قیمت اعمال={wrap_num_ltr(f'{K1:,.0f}')} | پرمیوم={wrap_num_ltr(f'{prem1:,.0f}')}",
+                            f"خرید 2× Call: <b>{c2.get('ticker')}</b> | قیمت اعمال={wrap_num_ltr(f'{K2:,.0f}')} | پرمیوم={wrap_num_ltr(f'{prem2:,.0f}')}",
+                            f"فروش Call: <b>{c3.get('ticker')}</b> | قیمت اعمال={wrap_num_ltr(f'{K3:,.0f}')} | پرمیوم={wrap_num_ltr(f'{prem3:,.0f}')}",
+                            f"اعتبار (Credit) = {wrap_num_ltr(f'{credit:,.0f}')}",
+                        ])
+                        rows.append(make_row("Short Call Butterfly", mat, legs, -credit, max_profit, max_loss, f"{be_low:,.0f} , {be_high:,.0f}", payoff, np.nan, days_left))
+
+        # --- Long Box / Short Box (با 2 استرایک مشترک)
+        if len(calls_n) and len(puts_n):
+            calls_n2 = calls_n.copy()
+            puts_n2 = puts_n.copy()
+            calls_n2["K"] = calls_n2["strike_price"].astype(float)
+            puts_n2["K"] = puts_n2["strike_price"].astype(float)
+            common = sorted(set(calls_n2["K"]).intersection(set(puts_n2["K"])))
+            common = sorted(common, key=lambda k: abs(k - S0))[:12]
+            common_sorted = sorted(common)
+            for a in range(len(common_sorted) - 1):
+                for b in range(a + 1, len(common_sorted)):
+                    K1, K2 = float(common_sorted[a]), float(common_sorted[b])
+                    if K2 <= K1:
+                        continue
+                    cK1 = calls_n2[calls_n2["K"] == K1].iloc[0].to_dict()
+                    cK2 = calls_n2[calls_n2["K"] == K2].iloc[0].to_dict()
+                    pK1 = puts_n2[puts_n2["K"] == K1].iloc[0].to_dict()
+                    pK2 = puts_n2[puts_n2["K"] == K2].iloc[0].to_dict()
+
+                    prem_c1, prem_c2 = float(cK1.get("premium") or 0.0), float(cK2.get("premium") or 0.0)
+                    prem_p1, prem_p2 = float(pK1.get("premium") or 0.0), float(pK2.get("premium") or 0.0)
+
+                    # Long Box: (Buy call spread) + (Buy put spread)
+                    cost = (prem_c1 - prem_c2) + (prem_p2 - prem_p1)
+                    payoff = (K2 - K1) - cost
+                    legs = legs_html([
+                        f"خرید Call(K1): <b>{cK1.get('ticker')}</b> | قیمت اعمال={wrap_num_ltr(f'{K1:,.0f}')} | پرمیوم={wrap_num_ltr(f'{prem_c1:,.0f}')}",
+                        f"فروش Call(K2): <b>{cK2.get('ticker')}</b> | قیمت اعمال={wrap_num_ltr(f'{K2:,.0f}')} | پرمیوم={wrap_num_ltr(f'{prem_c2:,.0f}')}",
+                        f"خرید Put(K2): <b>{pK2.get('ticker')}</b> | قیمت اعمال={wrap_num_ltr(f'{K2:,.0f}')} | پرمیوم={wrap_num_ltr(f'{prem_p2:,.0f}')}",
+                        f"فروش Put(K1): <b>{pK1.get('ticker')}</b> | قیمت اعمال={wrap_num_ltr(f'{K1:,.0f}')} | پرمیوم={wrap_num_ltr(f'{prem_p1:,.0f}')}",
+                        f"هزینه خالص = {wrap_num_ltr(f'{cost:,.0f}')}",
+                    ])
+                    rows.append(make_row("Long Box", mat, legs, cost, f"{(K2-K1 - cost):,.0f}", f"{(K2-K1 - cost):,.0f}", "—", payoff, np.nan, days_left))
+
+                    # Short Box: دریافت اعتبار و پرداخت (K2-K1) در سررسید
+                    credit = -cost
+                    payoff_s = credit - (K2 - K1)
+                    legs_s = legs_html([
+                        f"فروش Call(K1): <b>{cK1.get('ticker')}</b> | قیمت اعمال={wrap_num_ltr(f'{K1:,.0f}')} | پرمیوم={wrap_num_ltr(f'{prem_c1:,.0f}')}",
+                        f"خرید Call(K2): <b>{cK2.get('ticker')}</b> | قیمت اعمال={wrap_num_ltr(f'{K2:,.0f}')} | پرمیوم={wrap_num_ltr(f'{prem_c2:,.0f}')}",
+                        f"فروش Put(K2): <b>{pK2.get('ticker')}</b> | قیمت اعمال={wrap_num_ltr(f'{K2:,.0f}')} | پرمیوم={wrap_num_ltr(f'{prem_p2:,.0f}')}",
+                        f"خرید Put(K1): <b>{pK1.get('ticker')}</b> | قیمت اعمال={wrap_num_ltr(f'{K1:,.0f}')} | پرمیوم={wrap_num_ltr(f'{prem_p1:,.0f}')}",
+                        f"اعتبار خالص = {wrap_num_ltr(f'{credit:,.0f}')}",
+                    ])
+                    rows.append(make_row("Short Box", mat, legs_s, -credit, payoff_s, payoff_s, "—", payoff_s, np.nan, days_left))
+
+# --- Iron Condor (Short / Credit): Sell OTM Put + Buy lower Put + Sell OTM Call + Buy higher Call
+        if len(calls_n) and len(puts_n):
+            c_otm = calls_n[calls_n["strike_price"].astype(float) >= S0].sort_values("strike_price").head(8)
+            p_otm = puts_n[puts_n["strike_price"].astype(float) <= S0].sort_values("strike_price", ascending=False).head(8)
+
+            p_wings = puts_n.sort_values("strike_price", ascending=False).head(12)
+            c_wings = calls_n.sort_values("strike_price").head(12)
+
+            for _, sp in p_otm.iterrows():  # short put
+                K2 = float(sp["strike_price"])
+                prem_sp = float(sp["premium"])
+                lp_cands = p_wings[p_wings["strike_price"].astype(float) < K2].sort_values("strike_price", ascending=False).head(4)
+                for _, lp in lp_cands.iterrows():
+                    K1 = float(lp["strike_price"])
+                    prem_lp = float(lp["premium"])
+
+                    for _, sc in c_otm.iterrows():  # short call
+                        K3 = float(sc["strike_price"])
+                        prem_sc = float(sc["premium"])
+                        lc_cands = c_wings[c_wings["strike_price"].astype(float) > K3].sort_values("strike_price").head(4)
+                        for _, lc in lc_cands.iterrows():
+                            K4 = float(lc["strike_price"])
+                            prem_lc = float(lc["premium"])
+
+                            if not (K1 < K2 < K3 < K4):
+                                continue
+
+                            credit = (prem_sp - prem_lp) + (prem_sc - prem_lc)
+
+                            payoff = credit                                      + (-max(K2 - S_target, 0.0) + max(K1 - S_target, 0.0))                                      + (-max(S_target - K3, 0.0) + max(S_target - K4, 0.0))
+
+                            put_width = K2 - K1
+                            call_width = K4 - K3
+
+                            max_profit = credit
+                            max_loss_low = credit - put_width
+                            max_loss_high = credit - call_width
+                            max_loss = min(max_loss_low, max_loss_high)
+
+                            be_low = K2 - credit
+                            be_high = K3 + credit
+                            margin = max(put_width, call_width)
+                            roi = (payoff / margin * 100.0) if margin > 0 else np.nan
+
+                            legs = legs_html([
+                                f"فروش Put: <b>{sp.get('ticker')}</b> | قیمت اعمال={wrap_num_ltr(f'{K2:,.0f}')} | پرمیوم={wrap_num_ltr(f'{prem_sp:,.0f}')}",
+                                f"خرید Put: <b>{lp.get('ticker')}</b> | قیمت اعمال={wrap_num_ltr(f'{K1:,.0f}')} | پرمیوم={wrap_num_ltr(f'{prem_lp:,.0f}')}",
+                                f"فروش Call: <b>{sc.get('ticker')}</b> | قیمت اعمال={wrap_num_ltr(f'{K3:,.0f}')} | پرمیوم={wrap_num_ltr(f'{prem_sc:,.0f}')}",
+                                f"خرید Call: <b>{lc.get('ticker')}</b> | قیمت اعمال={wrap_num_ltr(f'{K4:,.0f}')} | پرمیوم={wrap_num_ltr(f'{prem_lc:,.0f}')}",
+                                f"اعتبار خالص (Credit) = {wrap_num_ltr(f'{credit:,.0f}')}",
+                            ])
+
+                            rows.append(make_row("Iron Condor (Short)", mat, legs, -credit, max_profit, max_loss,
+                                                 f"{be_low:,.0f} , {be_high:,.0f}", payoff, roi, days_left))
+
+        # --- Butterfly (Call): Buy 1 Call (K1) + Sell 2 Call (K2) + Buy 1 Call (K3)
+        if len(calls_n) >= 3:
+            c_sorted = calls_n.sort_values("strike_price")
+            c_list = c_sorted.to_dict("records")[:14]  # cap
+            for i in range(len(c_list) - 2):
+                for j in range(i + 1, len(c_list) - 1):
+                    for k in range(j + 1, len(c_list)):
+                        c1, c2, c3 = c_list[i], c_list[j], c_list[k]
+                        K1, K2, K3 = float(c1["strike_price"]), float(c2["strike_price"]), float(c3["strike_price"])
+                        if not (K1 < K2 < K3):
+                            continue
+                        prem1, prem2, prem3 = float(c1["premium"]), float(c2["premium"]), float(c3["premium"])
+                        debit = prem1 - 2.0 * prem2 + prem3
+                        if debit <= 0:
+                            continue
+
+                        payoff = (max(S_target - K1, 0.0) - 2.0 * max(S_target - K2, 0.0) + max(S_target - K3, 0.0)) - debit
+                        max_profit = (K2 - K1) - debit
+                        max_loss = -debit
+                        be_low = K1 + debit
+                        be_high = K3 - debit
+                        roi = (payoff / debit * 100.0) if debit > 0 else np.nan
+
+                        legs = legs_html([
+                            f"خرید Call: <b>{c1.get('ticker')}</b> | قیمت اعمال={wrap_num_ltr(f'{K1:,.0f}')} | پرمیوم={wrap_num_ltr(f'{prem1:,.0f}')}",
+                            f"فروش 2× Call: <b>{c2.get('ticker')}</b> | قیمت اعمال={wrap_num_ltr(f'{K2:,.0f}')} | پرمیوم={wrap_num_ltr(f'{prem2:,.0f}')}",
+                            f"خرید Call: <b>{c3.get('ticker')}</b> | قیمت اعمال={wrap_num_ltr(f'{K3:,.0f}')} | پرمیوم={wrap_num_ltr(f'{prem3:,.0f}')}",
+                            f"هزینه خالص (Debit) = {wrap_num_ltr(f'{debit:,.0f}')}",
+                        ])
+
+                        rows.append(make_row("Long Call Butterfly", mat, legs, debit, max_profit, max_loss,
+                                             f"{be_low:,.0f} , {be_high:,.0f}", payoff, roi, days_left))
+
+
+    if not rows:
+        st.warning("هیچ استراتژی قابل محاسبه‌ای پیدا نشد (ممکن است داده‌های Call/Put کافی نباشد).")
+        st.stop()
+
+    out = pd.DataFrame(rows)
+    # فقط استراتژی‌های درخواستی
+    wanted = {
+        "Long Call","Long Put","Short Call","Short Put","Covered Call","Protective Put",
+        "Bull Call Spread","Bear Call Spread","Bear Put Spread","Call Ratio Spread",
+        "Long Straddle","Short Straddle","Long Strangle","Short Strangle",
+        "Long Gut","Short Gut","Long Call Butterfly","Short Call Butterfly",
+        "Long Box","Short Box","Collar","Conversion","Iron Condor (Short)"
+    }
+    out = out[out["استراتژی"].isin(wanted)].copy()
+
+
+    # مرتب‌سازی کلی: بیشترین سود در S هدف
+    out["سود در S هدف"] = pd.to_numeric(out["سود در S هدف"], errors="coerce")
+    out_sorted = out.sort_values("سود در S هدف", ascending=False)
+
+    best = out_sorted.iloc[0].to_dict()
+    st.success(
+        f"بهترین استراتژی بر اساس سود در S هدف: **{best['استراتژی']}** | سررسید **{best['سررسید']}** | سود: {best['سود در S هدف']:,.2f}"
+    )
+    st.markdown("**لِگ‌ها:**", unsafe_allow_html=True)
+    st.markdown(safe_str(best.get("لِگ‌ها")), unsafe_allow_html=True)
+
+    st.markdown("---")
+    st.markdown("### 📋 جدول بهترین‌ها (کلی)")
+    show_cols = [
+        "استراتژی",
+        "سررسید",
+        "مانده (روز)",
+        "هزینه/دریافتی (پرمیوم خالص)",
+        "حداکثر سود",
+        "حداکثر زیان",
+        "نقطه/نقاط سربه‌سر",
+        "سود در S هدف",
+        "ROI% تقریبی",
+        "لِگ‌ها",
+    ]
+
+    # فرمت‌کردن برای نمایش RTL-safe
+    view = out_sorted[show_cols].head(int(top_n)).copy()
+
+    def _fmt(v, col):
+        if v is None or _is_na(v):
+            return "—"
+        if col in ["استراتژی", "سررسید", "لِگ‌ها", "نقطه/نقاط سربه‌سر"]:
+            return safe_str(v)
+        if isinstance(v, str):
+            return v
+        try:
+            fv = float(v)
+            if not np.isfinite(fv):
+                return "—"
+            if col in ["ROI% تقریبی"]:
+                return wrap_num_ltr(f"{fv:,.2f}%")
+            return wrap_num_ltr(f"{fv:,.2f}")
+        except Exception:
+            return safe_str(v)
+
+    for c in view.columns:
+        view[c] = view[c].apply(lambda x, cc=c: _fmt(x, cc))
+
+    show_table(out_sorted[show_cols].copy(), "Top نتایج (قابل مرتب‌سازی + بدون نصفه شدن اعداد)", "tbl_top", int(top_n))
+
+    st.markdown("---")
+    
+    st.markdown("---")
+    st.markdown("### 📚 تب جداگانه برای هر استراتژی + راهنما")
+
+    guides = {
+        "Long Call": """**لانگ کال (Long Call)**  
+- **ساختار:** خرید ۱ قرارداد Call  
+- **دیدگاه:** صعودی (Bullish)  
+- **حداکثر زیان:** پرمیوم پرداختی  
+- **حداکثر سود:** نامحدود  
+- **سربه‌سر:** قیمت اعمال + پرمیوم  
+- **نکته:** برای حرکت‌های صعودی بزرگ مناسب است؛ زمان (Theta) به ضرر شماست.""",
+
+        "Long Put": """**لانگ پوت (Long Put)**  
+- **ساختار:** خرید ۱ قرارداد Put  
+- **دیدگاه:** نزولی (Bearish)  
+- **حداکثر زیان:** پرمیوم پرداختی  
+- **حداکثر سود:** تقریباً تا (قیمت اعمال - پرمیوم) (در حد S→0)  
+- **سربه‌سر:** قیمت اعمال − پرمیوم  
+- **نکته:** برای ریزش‌های شدید یا پوشش ریسک مناسب است.""",
+
+        "Short Call": """**شورت کال (Short Call)**  
+- **ساختار:** فروش ۱ قرارداد Call  
+- **دیدگاه:** خنثی تا نزولی  
+- **حداکثر سود:** پرمیوم دریافتی  
+- **حداکثر زیان:** نامحدود (با رشد قیمت پایه)  
+- **سربه‌سر:** قیمت اعمال + پرمیوم  
+- **نکته:** پرریسک؛ معمولاً با پوشش (Covered) یا اسپرد استفاده می‌شود.""",
+
+        "Short Put": """**شورت پوت (Short Put)**  
+- **ساختار:** فروش ۱ قرارداد Put (معمولاً Cash-Secured)  
+- **دیدگاه:** خنثی تا صعودی  
+- **حداکثر سود:** پرمیوم دریافتی  
+- **حداکثر زیان:** محدود (تا S→0): پرمیوم − قیمت اعمال  
+- **سربه‌سر:** قیمت اعمال − پرمیوم  
+- **نکته:** شبیه سفارش خرید سهم با تخفیف (اگر Cash-Secured باشد).""",
+
+        "Covered Call": """**کاورد کال (Covered Call)**  
+- **ساختار:** خرید سهم پایه + فروش Call  
+- **دیدگاه:** خنثی تا کمی صعودی  
+- **حداکثر سود:** (قیمت اعمال − قیمت خرید سهم) + پرمیوم  
+- **حداکثر زیان:** شبیه نگهداری سهم (با کمی کاهش به اندازه پرمیوم)  
+- **سربه‌سر:** قیمت سهم − پرمیوم  
+- **نکته:** مناسب برای درآمدزایی از سهم در بازار خنثی/آرام.""",
+
+        "Protective Put": """**پروتکتیو پوت (Protective Put)**  
+- **ساختار:** خرید سهم پایه + خرید Put  
+- **دیدگاه:** صعودی با بیمه نزول  
+- **حداکثر سود:** نامحدود  
+- **حداکثر زیان:** محدود (تقریباً تا سطح K) + هزینه بیمه (پرمیوم)  
+- **سربه‌سر:** قیمت سهم + پرمیوم  
+- **نکته:** مثل «بیمه کردن» سهم است.""",
+
+        "Bull Call Spread": """**بول کال اسپرد (Bull Call Spread)**  
+- **ساختار:** خرید Call با K پایین + فروش Call با K بالاتر  
+- **دیدگاه:** صعودی کنترل‌شده  
+- **حداکثر زیان:** بدهی اولیه (Debit)  
+- **حداکثر سود:** (اختلاف دو قیمت اعمال − Debit)  
+- **سربه‌سر:** K پایین + Debit  
+- **نکته:** هزینه کمتر از لانگ کال، اما سود سقف‌دار.""",
+
+        "Bear Call Spread": """**بیر کال اسپرد (Bear Call Spread)**  
+- **ساختار:** فروش Call با K پایین + خرید Call با K بالاتر (Credit Spread)  
+- **دیدگاه:** خنثی تا نزولی  
+- **حداکثر سود:** اعتبار دریافتی (Credit)  
+- **حداکثر زیان:** (اختلاف قیمت اعمال − Credit)  
+- **سربه‌سر:** K پایین + Credit  
+- **نکته:** برای بازارهای رنج/نزولی ملایم.""",
+
+        "Bear Put Spread": """**بیر پوت اسپرد (Bear Put Spread)**  
+- **ساختار:** خرید Put با K بالاتر + فروش Put با K پایین‌تر  
+- **دیدگاه:** نزولی کنترل‌شده  
+- **حداکثر زیان:** Debit  
+- **حداکثر سود:** (اختلاف قیمت اعمال − Debit)  
+- **سربه‌سر:** K بالاتر − Debit  
+- **نکته:** هزینه کمتر از لانگ پوت، اما سود سقف‌دار.""",
+
+        "Call Ratio Spread": """**کال ریشیو اسپرد (Call Ratio Spread)**  
+- **ساختار رایج (1×2):** خرید ۱ Call با K پایین + فروش ۲ Call با K بالاتر  
+- **دیدگاه:** صعودی تا محدوده‌ای (اما با ریسک رشد شدید)  
+- **حداکثر سود:** معمولاً در حوالی K بالاتر رخ می‌دهد  
+- **حداکثر زیان:** می‌تواند نامحدود شود (اگر تعداد شورت بیشتر باشد)  
+- **نکته:** استراتژی حرفه‌ای؛ مدیریت ریسک و وجه تضمین مهم است.""",
+
+        "Long Straddle": """**لانگ استردل (Long Straddle)**  
+- **ساختار:** خرید Call + خرید Put با یک قیمت اعمال (نزدیک ATM)  
+- **دیدگاه:** انتظار نوسان شدید (بی‌جهت)  
+- **حداکثر زیان:** مجموع پرمیوم‌ها  
+- **حداکثر سود:** نامحدود  
+- **سربه‌سر:** K ± مجموع پرمیوم  
+- **نکته:** مناسب قبل از خبر/رویداد مهم.""",
+
+        "Short Straddle": """**شورت استردل (Short Straddle)**  
+- **ساختار:** فروش Call + فروش Put با یک قیمت اعمال  
+- **دیدگاه:** انتظار بازار رنج و کاهش نوسان  
+- **حداکثر سود:** مجموع پرمیوم دریافتی  
+- **حداکثر زیان:** نامحدود  
+- **سربه‌سر:** K ± مجموع پرمیوم  
+- **نکته:** پرریسک و نیازمند مدیریت وجه تضمین.""",
+
+        "Long Strangle": """**لانگ استرنگل (Long Strangle)**  
+- **ساختار:** خرید Put با K پایین‌تر + خرید Call با K بالاتر  
+- **دیدگاه:** انتظار نوسان؛ هزینه کمتر از استردل  
+- **حداکثر زیان:** مجموع پرمیوم‌ها  
+- **حداکثر سود:** نامحدود  
+- **سربه‌سر:** Kp − net و Kc + net  
+- **نکته:** برای حرکت بزرگ در هر جهت.""",
+
+        "Short Strangle": """**شورت استرنگل (Short Strangle)**  
+- **ساختار:** فروش Put (OTM) + فروش Call (OTM)  
+- **دیدگاه:** بازار رنج  
+- **حداکثر سود:** مجموع پرمیوم دریافتی  
+- **حداکثر زیان:** نامحدود  
+- **سربه‌سر:** Kp − credit و Kc + credit  
+- **نکته:** نسبت به شورت استردل کمی امن‌تر اما همچنان پرریسک.""",
+
+        "Long Gut": """**لانگ گات (Long Gut)**  
+- **ساختار:** خرید Call (ITM) + خرید Put (ITM) با دو قیمت اعمال متفاوت  
+- **دیدگاه:** انتظار حرکت بزرگ در هر جهت (با هزینه/ساختار متفاوت از استردل)  
+- **حداکثر زیان:** مجموع پرمیوم‌ها  
+- **حداکثر سود:** نامحدود  
+- **نکته:** کمتر رایج؛ قراردادهای ITM ممکن است نقدشوندگی متفاوتی داشته باشند.""",
+
+        "Short Gut": """**شورت گات (Short Gut)**  
+- **ساختار:** فروش Call (ITM) + فروش Put (ITM)  
+- **دیدگاه:** بازار رنج با دریافت پرمیوم بیشتر (اما ریسک بالا)  
+- **حداکثر سود:** مجموع پرمیوم دریافتی  
+- **حداکثر زیان:** نامحدود  
+- **نکته:** حرفه‌ای/پرریسک.""",
+
+        "Long Call Butterfly": """**لانگ کال باترفلای (Long Call Butterfly)**  
+- **ساختار:** خرید Call(K1) + فروش 2× Call(K2) + خرید Call(K3) (K1<K2<K3)  
+- **دیدگاه:** انتظار بازار نزدیک K2 در سررسید  
+- **حداکثر زیان:** Debit  
+- **حداکثر سود:** محدود (معمولاً حوالی K2)  
+- **نکته:** برای کاهش هزینه و شرط‌بندی روی نوسان پایین.""",
+
+        "Short Call Butterfly": """**شورت کال باترفلای (Short Call Butterfly)**  
+- **ساختار:** معکوس باترفلای لانگ (دریافت Credit)  
+- **دیدگاه:** انتظار حرکت دور از K2  
+- **حداکثر سود:** Credit  
+- **حداکثر زیان:** محدود  
+- **نکته:** ریسک/بازده محدود، اما نیازمند مدیریت.""",
+
+        "Long Box": """**لانگ باکس (Long Box)**  
+- **ساختار:** (Bull Call Spread) + (Bear Put Spread) با دو استرایک مشترک  
+- **نتیجه:** پرداخت ثابت (K2−K1) در سررسید (شبیه وام دادن)  
+- **نکته:** اختلاف قیمت با ارزش تئوریک = نرخ بهره/هزینه‌ها.""",
+
+        "Short Box": """**شورت باکس (Short Box)**  
+- **ساختار:** معکوس لانگ باکس (دریافت ثابت در ابتدا، پرداخت (K2−K1) در سررسید)  
+- **نتیجه:** شبیه وام گرفتن  
+- **نکته:** هزینه‌ها/وجه تضمین مهم است.""",
+
+        "Collar": """**کالر (Collar)**  
+- **ساختار:** خرید سهم + خرید Put (OTM) + فروش Call (OTM)  
+- **دیدگاه:** محدود کردن زیان و سقف‌دار کردن سود  
+- **حداکثر سود:** محدود (تا Kc)  
+- **حداکثر زیان:** محدود (تا Kp)  
+- **نکته:** مناسب مدیریت ریسک روی سهم.""",
+
+        "Conversion": """**کانورژن (Conversion)**  
+- **ساختار:** خرید سهم + خرید Put + فروش Call (هم‌استرایک)  
+- **نتیجه:** سود/زیان تقریباً ثابت (آربیتراژی نظری)  
+- **نکته:** در عمل کارمزد/اسپرد/محدودیت‌ها تعیین‌کننده‌اند.""",
+ "Iron Condor (Short)": """**آیرون کندور (Iron Condor - Short/Credit)**  
++- **ساختار:** فروش Put (OTM) + خرید Put پایین‌تر (Wing) + فروش Call (OTM) + خرید Call بالاتر (Wing)  
++- **دیدگاه:** بازار رنج / کاهش نوسان (Short Vol)  
++- **حداکثر سود:** اعتبار (Credit) دریافتی  
++- **حداکثر زیان:** محدود (عرض یکی از بال‌ها − Credit)  
++- **سربه‌سر:** K_put_short − Credit  و  K_call_short + Credit  
++- **نکته:** نسبت به Short Strangle ریسک محدودتر است و برای بازارهای آرام مناسب است.""",
+    }
+
+    strat_order = [
+        "Long Call","Long Put","Short Call","Short Put","Covered Call",
+        "Protective Put","Bull Call Spread","Bear Call Spread","Bear Put Spread",
+        "Call Ratio Spread","Long Straddle","Short Straddle","Long Strangle","Short Strangle",
+        "Long Gut","Short Gut","Long Call Butterfly","Short Call Butterfly","Long Box","Short Box",
+        "Collar","Conversion","Iron Condor (Short)"
+    ]
+
+    tabs = st.tabs([f"📌 {n}" for n in strat_order])
+    for t, strat_name in zip(tabs, strat_order):
+        with t:
+            render_rtl_guide(guides.get(strat_name, ""))
+            sub = out[out["استراتژی"] == strat_name].copy()
+            if len(sub) == 0:
+                st.info("برای این استراتژی ترکیب قابل محاسبه‌ای در داده‌های فعلی پیدا نشد.")
+                continue
+            sub = sub.sort_values("سود در S هدف", ascending=False).head(int(top_n))
+            show_table(sub[show_cols].copy(), f"نتایج: {strat_name}", f"tbl_{strat_name}", int(top_n))
 # ============================================================
 # TAB 3: History (Option + Underlying) like before
 # ============================================================
@@ -1197,6 +2438,60 @@ with tab_history:
                     return c
             num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
             return num_cols[0] if num_cols else None
+        def get_ohlc_cols(df: pd.DataFrame):
+            if df is None or len(df) == 0:
+                return None
+
+            open_cand = ["Open", "open", "POpen", "بازگشایی", "باز", "قیمت بازگشایی"]
+            high_cand = ["High", "high", "PHigh", "بیشترین", "سقف", "قیمت بیشینه"]
+            low_cand  = ["Low", "low", "PLow", "کمترین", "کف", "قیمت کمینه"]
+            close_cand = ["Close", "close", "PClosing", "پایانی", "قیمت پایانی", "Adj Close", "AdjClose", "پایانی تعدیل‌شده"]
+
+            def pick(cands):
+                for c in cands:
+                    if c in df.columns:
+                        return c
+                return None
+
+            o = pick(open_cand)
+            h = pick(high_cand)
+            l = pick(low_cand)
+            c = pick(close_cand)
+
+            if any(x is None for x in [o, h, l, c]):
+                num_cols = [cc for cc in df.columns if cc != "Date" and pd.api.types.is_numeric_dtype(df[cc])]
+                if len(num_cols) >= 4:
+                    o = o or num_cols[0]
+                    h = h or num_cols[1]
+                    l = l or num_cols[2]
+                    c = c or num_cols[3]
+
+            if all(x is not None for x in [o, h, l, c]):
+                return {"open": o, "high": h, "low": l, "close": c}
+            return None
+
+        def plot_candlestick(df: pd.DataFrame, title: str):
+            if df is None or len(df) == 0:
+                st.warning("داده‌ای برای کندلی موجود نیست.")
+                return
+            cols = get_ohlc_cols(df)
+            if not cols:
+                st.warning("ستون‌های OHLC برای رسم کندلی پیدا نشد.")
+                return
+            fig = go.Figure(
+                data=[
+                    go.Candlestick(
+                        x=df["Date"],
+                        open=df[cols["open"]],
+                        high=df[cols["high"]],
+                        low=df[cols["low"]],
+                        close=df[cols["close"]],
+                    )
+                ]
+            )
+            fig.update_layout(title=title, xaxis_title="Date", yaxis_title="Price")
+            st.plotly_chart(fig, use_container_width=True)
+
 
         opt_hist = None
         ua_hist = None
@@ -1224,6 +2519,9 @@ with tab_history:
                     fig = px.line(opt_hist, x="Date", y=pcol, title=f"تاریخچه قیمت آپشن: {opt_ticker}")
                     st.plotly_chart(fig, use_container_width=True)
 
+                    st.markdown("#### کندلی")
+                    plot_candlestick(opt_hist, title=f"کندلی آپشن: {opt_ticker}")
+
         with left:
             st.markdown("### نمودار سهم پایه")
             if ua_hist is None:
@@ -1235,6 +2533,9 @@ with tab_history:
                 else:
                     fig = px.line(ua_hist, x="Date", y=pcol, title=f"تاریخچه قیمت سهم پایه: {ua_ticker}")
                     st.plotly_chart(fig, use_container_width=True)
+
+                    st.markdown("#### کندلی")
+                    plot_candlestick(ua_hist, title=f"کندلی سهم پایه: {ua_ticker}")
 
         st.markdown("---")
 

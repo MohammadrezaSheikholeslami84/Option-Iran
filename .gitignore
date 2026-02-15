@@ -1,0 +1,16 @@
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.ipynb_checkpoints/
+*.ipynb
+.DS_Store
+
+# Streamlit cache
+.streamlit/cache/
+
+# OS / IDE
+.vscode/
+.idea/
